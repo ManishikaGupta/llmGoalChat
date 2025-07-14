@@ -1,29 +1,23 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
-import whisper
-import numpy as np
-import av
-import os
+# Import necessary libraries
+import streamlit as st 
 import google.generativeai as genai
 from dotenv import load_dotenv
+import os
+import pandas as pd
 
-# Load environment variables
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Whisper model (use 'tiny' or 'base' for faster response)
-asr_model = whisper.load_model("base")
+# Initialise Gemini Model
+model = genai.GenerativeModel('gemini-2.0-flash')
 
-# Set up page
-st.set_page_config(page_title="Voice Budget Assistant", layout="centered")
-st.title("🎙️ Voice Budget Assistant")
-st.markdown("Click **Start**, speak your income and financial goals, then click **Transcribe and Ask Gemini**.")
-
-# Domain prompt
+# Domain prompt that gives context to the LLM
 DOMAIN_PROMPT = """
 You are a helpful and knowledgeable financial advisor.
 
-Your task is to assist users in optimizing their monthly budgets based on their income and specific financial goals. When the user provides this information, respond with a clear, actionable, and realistic monthly budget plan.
+Your task is to assist users in optimizing their monthly budgets based on their income, past spending patterns, and specific financial goals.
+
+When the user provides this information, respond with a clear, actionable, and realistic monthly budget plan.
 
 Break the user's income into the following categories:
 - Essentials (e.g. rent, groceries, bills)
@@ -33,59 +27,84 @@ Break the user's income into the following categories:
 - Lifestyle (e.g. dining, shopping, travel)
 
 Explain how each part supports the user's goals. Make sure your recommendations are practical and aligned with their income level and timelines.
+
+If the user asks a question unrelated to budgeting or financial goals, politely decline.
 """
 
-# Audio processor
-class AudioProcessor:
-    def __init__(self):
-        self.frames = []
+# Streamlit setup
+st.set_page_config(page_title="Goal-Based Budget Optimizer", layout="centered")
+st.title("📊 Budget Optimization Assistant")
+st.markdown("Tell me your income and goals, or upload your past expenses to get started!")
 
-    def recv(self, frame: av.AudioFrame):
-        self.frames.append(frame.to_ndarray().flatten())
+# CSV Parser
+def parse_expense_csv(file_path):
+    df = pd.read_csv(file_path)
 
-    def transcribe(self):
-        if not self.frames:
-            return ""
-        audio = np.concatenate(self.frames).astype(np.float32) / 32768.0
-        result = asr_model.transcribe(audio)
-        return result["text"]
+    # Map CSV column names to expected names
+    column_mapping = {
+        'Narration / Description': 'Description',
+        'Amount (₹)': 'Amount',
+        'Balance (₹)': 'Balance',
+        'Reference No.': 'Reference Number'
+    }
 
-# Store processor in session
-if "audio_processor" not in st.session_state:
-    st.session_state.audio_processor = AudioProcessor()
+    df = df.rename(columns=column_mapping)
 
-# Streamlit WebRTC
-webrtc_ctx = webrtc_streamer(
-    key="mic-input",
-    mode=WebRtcMode.SENDONLY,
-    in_audio=True,
-    client_settings=ClientSettings(
-        media_stream_constraints={"audio": True, "video": False},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    ),
-    audio_frame_callback=st.session_state.audio_processor.recv,
-    audio_receiver_size=1024,
-    sendback_audio=False,
-)
+    # Check for required columns
+    required_columns = ['Date', 'Description', 'Amount', 'Type', 'Balance', 'Mode', 'Reference Number']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Missing column: {col}")
 
-# Transcribe and respond
-if st.button("📝 Transcribe and Ask Gemini"):
-    with st.spinner("Transcribing your speech..."):
-        user_input = st.session_state.audio_processor.transcribe()
+    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+    df['Description'] = df['Description'].astype(str).str.lower()
+    df['Type'] = df['Type'].astype(str).str.lower()
 
-    if user_input.strip():
-        st.success(f"🗣️ You said: {user_input}")
-        st.chat_message("user").markdown(user_input)
+    # Filter only debits
+    df = df[df['Type'] == 'debit']
+    return df
 
-        prompt = f"{DOMAIN_PROMPT}\n\nUser: {user_input}"
+# Store conversation history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-        try:
-            model = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
-            bot_reply = response.text
-        except Exception as e:
-            bot_reply = f"⚠️ Gemini Error: {e}"
+# Upload section
+uploaded_file = st.file_uploader("Upload your expense CSV file", type="csv")
+parsed_summary = ""
 
-        st.chat_message("assistant").markdown(bot_reply)
-    else:
-        st.warning("Couldn't capture your speech. Please try again.")
+if uploaded_file is not None:
+    try:
+        df = parse_expense_csv(uploaded_file)
+        total_expense = df['Amount'].sum()
+        top_categories = df['Description'].value_counts().head(5).to_string()
+
+        parsed_summary = f"\n\nHere is a summary of your uploaded expenses:\n\n- Total Debits: ₹{total_expense:,.2f}\n- Top expense categories:\n{top_categories}"
+        st.success("✅ Expense data uploaded and analyzed.")
+        st.markdown(parsed_summary)
+    except Exception as e:
+        st.error(f"⚠️ Error processing file: {e}")
+
+# Display previous messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Chat input
+user_input = st.chat_input("Hello 👋 What are your goals and monthly income?")
+
+if user_input:
+    st.chat_message("user").markdown(user_input)
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    # Combine prompt with optional parsed CSV insights
+    full_prompt = f"{DOMAIN_PROMPT}\n\nUser Input:\n{user_input}\n{parsed_summary}"
+
+    # Generate Gemini response
+    try:
+        response = model.generate_content(full_prompt)
+        bot_reply = response.text
+    except Exception as e:
+        bot_reply = f"⚠️ Error: {e}"
+
+    st.chat_message("assistant").markdown(bot_reply)
+    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
