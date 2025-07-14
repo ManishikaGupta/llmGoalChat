@@ -1,23 +1,29 @@
-# Import necessary libraries
-import streamlit as st 
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
+import whisper
+import numpy as np
+import av
 import google.generativeai as genai
 from dotenv import load_dotenv
 import os
-import pandas as pd
 
+# Load environment variables (Google API key)
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Initialise Gemini Model
-model = genai.GenerativeModel('gemini-2.0-flash')
+# Load Whisper ASR model
+asr_model = whisper.load_model("base")  # You can also use "tiny" for faster response
 
-# Domain prompt that gives context to the LLM
+# Streamlit page config
+st.set_page_config(page_title="🎙️ Voice Budget Assistant", layout="centered")
+st.title("🎧 Voice-Based Budget Optimization Assistant")
+st.markdown("Speak your income and financial goals. I’ll generate a personalized budget plan for you.")
+
+# Budgeting assistant context for Gemini
 DOMAIN_PROMPT = """
 You are a helpful and knowledgeable financial advisor.
 
-Your task is to assist users in optimizing their monthly budgets based on their income, past spending patterns, and specific financial goals.
-
-When the user provides this information, respond with a clear, actionable, and realistic monthly budget plan.
+Your task is to assist users in optimizing their monthly budgets based on their income and specific financial goals. When the user provides this information, respond with a clear, actionable, and realistic monthly budget plan.
 
 Break the user's income into the following categories:
 - Essentials (e.g. rent, groceries, bills)
@@ -31,80 +37,57 @@ Explain how each part supports the user's goals. Make sure your recommendations 
 If the user asks a question unrelated to budgeting or financial goals, politely decline.
 """
 
-# Streamlit setup
-st.set_page_config(page_title="Goal-Based Budget Optimizer", layout="centered")
-st.title("📊 Budget Optimization Assistant")
-st.markdown("Tell me your income and goals, or upload your past expenses to get started!")
+# Buffer class to receive audio
+class AudioProcessor:
+    def __init__(self):
+        self.frames = []
 
-# CSV Parser
-def parse_expense_csv(file_path):
-    df = pd.read_csv(file_path)
+    def recv(self, frame: av.AudioFrame):
+        self.frames.append(frame.to_ndarray().flatten())
 
-    # Map CSV column names to expected names
-    column_mapping = {
-        'Narration / Description': 'Description',
-        'Amount (₹)': 'Amount',
-        'Balance (₹)': 'Balance',
-        'Reference No.': 'Reference Number'
-    }
+    def get_transcription(self):
+        if not self.frames:
+            return ""
+        audio = np.concatenate(self.frames).astype(np.float32) / 32768.0
+        result = asr_model.transcribe(audio)
+        return result["text"]
 
-    df = df.rename(columns=column_mapping)
+# Add voice input section
+st.markdown("🎙️ Press Start, speak clearly, then click 'Transcribe and Ask Gemini'")
 
-    # Check for required columns
-    required_columns = ['Date', 'Description', 'Amount', 'Type', 'Balance', 'Mode', 'Reference Number']
-    for col in required_columns:
-        if col not in df.columns:
-            raise ValueError(f"Missing column: {col}")
+audio_processor = AudioProcessor()
 
-    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
-    df['Description'] = df['Description'].astype(str).str.lower()
-    df['Type'] = df['Type'].astype(str).str.lower()
+# Start WebRTC
+webrtc_ctx = webrtc_streamer(
+    key="speech-input",
+    mode=WebRtcMode.SENDONLY,
+    in_audio=True,
+    audio_receiver_size=256,
+    client_settings=ClientSettings(
+        media_stream_constraints={"audio": True, "video": False},
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    ),
+    audio_frame_callback=audio_processor.recv,
+    sendback_audio=False
+)
 
-    # Filter only debits
-    df = df[df['Type'] == 'debit']
-    return df
+# Transcribe and send to Gemini
+if st.button("📝 Transcribe and Ask Gemini"):
+    user_input = audio_processor.get_transcription()
 
-# Store conversation history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if user_input.strip():
+        st.success(f"🗣️ You said: {user_input}")
+        st.chat_message("user").markdown(user_input)
 
-# Upload section
-uploaded_file = st.file_uploader("Upload your expense CSV file", type="csv")
-parsed_summary = ""
+        prompt = f"{DOMAIN_PROMPT}\n\nUser: {user_input}"
 
-if uploaded_file is not None:
-    try:
-        df = parse_expense_csv(uploaded_file)
-        total_expense = df['Amount'].sum()
-        top_categories = df['Description'].value_counts().head(5).to_string()
+        try:
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            response = model.generate_content(prompt)
+            bot_reply = response.text
+        except Exception as e:
+            bot_reply = f"⚠️ Gemini Error: {e}"
 
-        parsed_summary = f"\n\nHere is a summary of your uploaded expenses:\n\n- Total Debits: ₹{total_expense:,.2f}\n- Top expense categories:\n{top_categories}"
-        st.success("✅ Expense data uploaded and analyzed.")
-        st.markdown(parsed_summary)
-    except Exception as e:
-        st.error(f"⚠️ Error processing file: {e}")
-
-# Display previous messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-# Chat input
-user_input = st.chat_input("Hello 👋 What are your goals and monthly income?")
-
-if user_input:
-    st.chat_message("user").markdown(user_input)
-    st.session_state.messages.append({"role": "user", "content": user_input})
-
-    # Combine prompt with optional parsed CSV insights
-    full_prompt = f"{DOMAIN_PROMPT}\n\nUser Input:\n{user_input}\n{parsed_summary}"
-
-    # Generate Gemini response
-    try:
-        response = model.generate_content(full_prompt)
-        bot_reply = response.text
-    except Exception as e:
-        bot_reply = f"⚠️ Error: {e}"
-
-    st.chat_message("assistant").markdown(bot_reply)
-    st.session_state.messages.append({"role": "assistant", "content": bot_reply})
+        st.chat_message("assistant").markdown(bot_reply)
+    else:
+        st.warning("⚠️ Couldn't transcribe your voice. Please speak clearly and try again.")
