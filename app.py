@@ -20,14 +20,12 @@ load_dotenv()
 # --- 3. LangChain Components Setup ---
 
 # Initialize the Generative AI model from LangChain
-# This provides a standard interface for the Gemini model
 llm = ChatGoogleGenerativeAI(
-    model="gemini-pro",
+    model="gemini-1.5-flash-latest", # This is the correct model name
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0.7,
-    convert_system_message_to_human=True # Gemini API compatibility
+    convert_system_message_to_human=True 
 )
-
 # Create a clean Prompt Template
 # This structure helps the model understand its role and the user's input variables.
 prompt_template = ChatPromptTemplate.from_messages(
