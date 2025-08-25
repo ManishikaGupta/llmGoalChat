@@ -8,3 +8,5 @@ numpy
 pandas
 av
 ffmpeg-python
+langchain
+langchain-google-genai
